@@ -955,6 +955,194 @@ async def gamble(interaction: discord.Interaction, amount: int):
     await interaction.response.send_message(embed=embed)
 
 
+DUEL_TIMEOUT = 120           # seconds a challenge stands before it lapses
+_open_duels = set()          # challenger ids with a challenge on the table. runtime only.
+
+DUEL_FLAVOUR = [
+    "The bone went up. Everybody watched it come down.",
+    "It span for an unreasonable length of time.",
+    "It landed in the ash and had to be dug out.",
+    "Greg called it in the air. Greg was ignored.",
+    "The tribe held its breath, which was unnecessary.",
+    "It bounced twice off the Sacred Rock before settling.",
+    "Nobody blinked. One of you should have.",
+    "The mammoth watched. The mammoth had no stake in this.",
+    "It came down flat and there was no arguing with it.",
+    "A bird tried to take it mid air and failed.",
+]
+
+
+def _other_side(side):
+    return "tails" if side == "heads" else "heads"
+
+
+def _side_label(side):
+    return "\U0001F5FF Heads" if side == "heads" else "\U0001F9B4 Tails"
+
+
+class DuelView(discord.ui.View):
+    """Two people, one bone, one flip. Both balances are checked again when the
+    challenge is accepted, because either of them can be spent while it sits there."""
+
+    def __init__(self, challenger, opponent, amount, side):
+        super().__init__(timeout=DUEL_TIMEOUT)
+        self.challenger = challenger
+        self.opponent = opponent
+        self.amount = amount
+        self.side = side
+        self.settled = False
+        self.message = None
+
+    def _close(self):
+        self.settled = True
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        _open_duels.discard(self.challenger.id)
+
+    @discord.ui.button(label="Accept", emoji="\U0001FA99", style=discord.ButtonStyle.success)
+    async def accept(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message(
+                "\U0001FA99 This is not your quarrel.", ephemeral=True)
+            return
+
+        one = user_record(self.challenger.id)
+        two = user_record(self.opponent.id)
+        short = None
+        if one["bones"] < self.amount:
+            short = self.challenger.display_name
+        elif two["bones"] < self.amount:
+            short = self.opponent.display_name
+
+        self._close()
+
+        if short is not None:
+            embed = discord.Embed(
+                title="\U0001FA99 THE FLIP",
+                description=f"**{short}** can no longer cover **{self.amount:,} Bones**.\n"
+                            "The wager collapses. No bone is thrown.",
+                colour=0x555555,
+            )
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        landed = random.choice(("heads", "tails"))
+        winner, loser = ((self.challenger, self.opponent) if landed == self.side
+                         else (self.opponent, self.challenger))
+        user_record(winner.id)["bones"] += self.amount
+        user_record(loser.id)["bones"] -= self.amount
+        await save_data()
+
+        embed = discord.Embed(
+            title="\U0001FA99 THE FLIP",
+            description=(
+                f"{self.challenger.display_name} called **{_side_label(self.side)}**.\n"
+                f"{self.opponent.display_name} took **{_side_label(_other_side(self.side))}**.\n\n"
+                f"{random.choice(DUEL_FLAVOUR)}\n\n"
+                f"### It landed {_side_label(landed)}\n"
+                f"**{winner.display_name}** takes **{self.amount:,} Bones** off "
+                f"**{loser.display_name}**."
+            ),
+            colour=0xC8A165,
+        )
+        embed.set_footer(
+            text=f"{winner.display_name}: {bones_of(winner.id):,} · "
+                 f"{loser.display_name}: {bones_of(loser.id):,}")
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    @discord.ui.button(label="Decline", emoji="\U0001F6AB", style=discord.ButtonStyle.secondary)
+    async def decline(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if interaction.user.id == self.opponent.id:
+            line = f"**{self.opponent.display_name}** declines. The bone stays on the ground."
+        elif interaction.user.id == self.challenger.id:
+            line = f"**{self.challenger.display_name}** withdraws the challenge. Noted by all."
+        else:
+            await interaction.response.send_message(
+                "\U0001FA99 This is not your quarrel.", ephemeral=True)
+            return
+        self._close()
+        embed = discord.Embed(title="\U0001FA99 THE FLIP", description=line, colour=0x555555)
+        await interaction.response.edit_message(embed=embed, view=self)
+
+    async def on_timeout(self):
+        if self.settled:
+            return
+        self._close()
+        if self.message is None:
+            return
+        embed = discord.Embed(
+            title="\U0001FA99 THE FLIP",
+            description=f"**{self.opponent.display_name}** did not answer. "
+                        "The challenge lapses.",
+            colour=0x555555,
+        )
+        try:
+            await self.message.edit(embed=embed, view=self)
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(name="duel", description="Challenge somebody to a coin flip for Bones.")
+@app_commands.describe(user="Who you are challenging.",
+                       amount="Bones on the line. Each of you stakes this much.",
+                       side="The side you are calling. They get the other one.")
+@app_commands.choices(side=[
+    app_commands.Choice(name="Heads", value="heads"),
+    app_commands.Choice(name="Tails", value="tails"),
+])
+async def duel(interaction: discord.Interaction, user: discord.Member, amount: int,
+               side: app_commands.Choice[str] = None):
+    if user.bot:
+        await interaction.response.send_message(
+            "\U0001FA99 I do not gamble with machines. Neither should you.", ephemeral=True)
+        return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message(
+            "\U0001FA99 Challenging yourself. Whoever wins, you lose.", ephemeral=True)
+        return
+    if amount <= 0:
+        await interaction.response.send_message(
+            "\U0001FA99 Wager a real number.", ephemeral=True)
+        return
+    if interaction.user.id in _open_duels:
+        await interaction.response.send_message(
+            "\U0001FA99 You already have a challenge on the table. One quarrel at a time.",
+            ephemeral=True)
+        return
+
+    mine = bones_of(interaction.user.id)
+    theirs = bones_of(user.id)
+    if mine < amount:
+        await interaction.response.send_message(
+            f"\U0001F9B4 You hold {mine:,} Bones. You cannot stake {amount:,}.", ephemeral=True)
+        return
+    if theirs < amount:
+        await interaction.response.send_message(
+            f"\U0001F9B4 {user.display_name} holds {theirs:,} Bones and cannot cover "
+            f"{amount:,}. Pick on somebody solvent.", ephemeral=True)
+        return
+
+    called = side.value if side else random.choice(("heads", "tails"))
+    view = DuelView(interaction.user, user, amount, called)
+    _open_duels.add(interaction.user.id)
+
+    embed = discord.Embed(
+        title="\U0001FA99 A CHALLENGE",
+        description=(
+            f"**{interaction.user.display_name}** challenges **{user.display_name}** "
+            f"to a flip for **{amount:,} Bones**.\n\n"
+            f"{interaction.user.display_name} calls **{_side_label(called)}**.\n"
+            f"{user.display_name} gets **{_side_label(_other_side(called))}**.\n\n"
+            "Winner takes the lot. Losing is also permitted."
+        ),
+        colour=0xC8A165,
+    )
+    embed.set_footer(text=f"{user.display_name} has {DUEL_TIMEOUT} seconds to answer")
+    await interaction.response.send_message(content=user.mention, embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+
 @bot.tree.command(name="shop", description="Inspect the goods.")
 async def shop(interaction: discord.Interaction):
     lines = [f"**{name}** · `{cost:,}` 🦴\n*{desc}*"
@@ -1504,6 +1692,7 @@ HELP_SECTIONS = {
         ("/bones [user]", "Check holdings. You earn 1 per message automatically."),
         ("/daily", "Daily allowance. 80 to 400 Bones."),
         ("/gamble <amount>", "Stake Bones. Roughly even odds."),
+        ("/duel <user> <amount>", "Challenge somebody to a coin flip. Both stake the same."),
         ("/rps", "Rock paper scissors. Everything is rock. 6% chance of Advanced Rock."),
         ("/shop", "The goods."),
         ("/buy", "Hand over Bones for one of them."),
@@ -1571,6 +1760,7 @@ COMMAND_HOMES = {
     "bones": "العظام",
     "daily": "العظام",
     "gamble": "العظام",
+    "duel": "العظام",
     "shop": "العظام",
     "buy": "العظام",
     "leaderboard": "العظام",
