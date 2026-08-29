@@ -3351,8 +3351,11 @@ def _event_channel():
 
 
 async def daily_stage():
-    """Today's thread. Everything I say goes in it, so the assembly stays
-    readable and every day I have spoken is still there to be read back."""
+    """Where the day's output goes. Straight into المجلس, not into a thread.
+
+    Ali asked for this on 2026-08-29, reversing the 2026-08-27 decision to use a
+    per-day thread. A header still goes up once a day so the days stay separable
+    when you scroll back, but everything after it is posted in the channel."""
     channel = _event_channel()
     if channel is None:
         return None
@@ -3361,37 +3364,18 @@ async def daily_stage():
     clock = DATA.setdefault("clock", {})
     stage = clock.get("stage") or {}
 
-    if stage.get("date") == today and stage.get("id"):
-        thread = channel.guild.get_thread(int(stage["id"]))
-        if thread is None:
-            try:
-                thread = await bot.fetch_channel(int(stage["id"]))
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                thread = None
-        if thread is not None:
-            if getattr(thread, "archived", False):
-                try:
-                    await thread.edit(archived=False)
-                except discord.HTTPException:
-                    pass
-            return thread
+    if stage.get("date") != today:
+        label = local_now().strftime("%d %B")
+        if label.startswith("0"):
+            label = label[1:]
+        try:
+            await channel.send(f"## \U0001f5ff THE CAVE, {label.upper()}")
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            print(f"[!] could not post today's header: {exc}")
+        clock["stage"] = {"date": today}
+        await save_data()
 
-    label = local_now().strftime("%d %B")
-    if label.startswith("0"):
-        label = label[1:]
-    try:
-        anchor = await channel.send(
-            f"## \U0001f5ff THE CAVE, {label.upper()}\n"
-            f"Everything I say today is in the thread below.")
-        thread = await anchor.create_thread(name=f"\U0001f5ff {label}",
-                                            auto_archive_duration=10080)
-    except (discord.Forbidden, discord.HTTPException) as exc:
-        print(f"[!] could not open today's thread: {exc}")
-        return channel
-
-    clock["stage"] = {"date": today, "id": thread.id}
-    await save_data()
-    return thread
+    return channel
 
 
 def local_now():
