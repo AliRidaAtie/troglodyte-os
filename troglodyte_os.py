@@ -100,6 +100,7 @@ def user_record(user_id):
         ("bones", 100), ("messages", 0), ("convictions", 0), ("acquittals", 0),
         ("bonks", 0), ("rps_wins", 0), ("rps_played", 0), ("last_daily", None),
         ("title_index", 0), ("last_spoke", None), ("fined", 0), ("crowned", 0),
+        ("last_raid", None), ("raids_won", 0),
     ):
         rec.setdefault(key, val)
     return rec
@@ -520,6 +521,7 @@ async def on_ready():
     for guild in bot.guilds:
         try:
             await restore_nicknames(guild)
+            await release_the_shamed(guild)
         except Exception as exc:
             print(f"[!] nickname restore failed: {exc}")
 
@@ -1143,6 +1145,330 @@ async def duel(interaction: discord.Interaction, user: discord.Member, amount: i
     view.message = await interaction.original_response()
 
 
+DICE_FACES = ("⚀", "⚁", "⚂", "⚃", "⚄", "⚅")
+
+
+def _face(n):
+    return DICE_FACES[n - 1] if 1 <= n <= 6 else str(n)
+
+
+@bot.tree.command(name="roll", description="Throw dice. The cave does not rig them.")
+@app_commands.describe(sides="How many sides. Six unless you say otherwise.",
+                       dice="How many dice. One unless you say otherwise.")
+async def roll(interaction: discord.Interaction, sides: int = 6, dice: int = 1):
+    if not 2 <= sides <= 1000:
+        await interaction.response.send_message(
+            "\U0001F3B2 Between 2 and 1000 sides. A one sided die is philosophy, not gambling.",
+            ephemeral=True)
+        return
+    if not 1 <= dice <= 10:
+        await interaction.response.send_message(
+            "\U0001F3B2 Between 1 and 10 dice. I have only so many hands.", ephemeral=True)
+        return
+
+    throws = [random.randint(1, sides) for _ in range(dice)]
+    shown = " ".join(f"{_face(n)} **{n}**" if sides == 6 else f"**{n}**" for n in throws)
+    body = f"{interaction.user.display_name} throws {dice}d{sides}.\n\n{shown}"
+    if dice > 1:
+        body += f"\n\nTotal: **{sum(throws)}**"
+
+    footers = [
+        "The dice are indifferent to you.",
+        "This was decided before you asked.",
+        "The Sacred Rock did not intervene.",
+        "Greg is watching and has opinions.",
+        "No refunds on outcomes.",
+    ]
+    embed = discord.Embed(title="\U0001F3B2 THE THROW", description=body, colour=0xC8A165)
+    embed.set_footer(text=random.choice(footers))
+    await interaction.response.send_message(embed=embed)
+
+
+# ---------------------------------------------------------------------------
+# the raid: once a day, everything they own, best of five dice
+# ---------------------------------------------------------------------------
+
+RAID_TIMEOUT = 180           # seconds a raid stands before it lapses
+RAID_TARGET = 3              # rounds needed. best of five.
+SHAME_HOURS = 24             # how long a bankrupt loser wears the consequence
+_open_raids = set()          # challenger ids with a raid on the table. runtime only.
+
+SHAME_NICKNAMES = [
+    "Bankrupt", "Owes Everybody", "Lost It All", "Formerly Wealthy",
+    "Financially Deceased", "Assets Frozen", "Under Administration",
+    "Collateral", "Repossessed", "Nothing To His Name",
+]
+
+SHAME_LINES = [
+    "The pockets were empty. The debt is now personal.",
+    "There was nothing to take, so something else was taken.",
+    "You cannot rob a man with no rocks. You can only rename him.",
+    "The Treasury inspected the pile and found dust.",
+    "Bankruptcy is not a defence in this cave.",
+]
+
+
+def _play_raid():
+    """First to three. A tied roll is thrown again, so every round has a winner
+    and the match cannot end level."""
+    rounds, score = [], [0, 0]
+    while max(score) < RAID_TARGET:
+        a, b = random.randint(1, 6), random.randint(1, 6)
+        if a == b:
+            rounds.append((a, b, None))
+            continue
+        who = 0 if a > b else 1
+        score[who] += 1
+        rounds.append((a, b, who))
+    return rounds, score
+
+
+def _raid_log(rounds, one, two):
+    lines, n = [], 0
+    for a, b, who in rounds:
+        if who is None:
+            lines.append(f"{_face(a)} **{a}**  vs  {_face(b)} **{b}**  ties, thrown again")
+            continue
+        n += 1
+        name = one.display_name if who == 0 else two.display_name
+        lines.append(f"**{n}.**  {_face(a)} **{a}**  vs  {_face(b)} **{b}**  to {name}")
+    return "\n".join(lines)
+
+
+def _raided_today(user_id):
+    return user_record(user_id).get("last_raid") == local_today()
+
+
+async def shame_the_broke(guild, loser, winner):
+    """No Bones to take, so the debt is collected in dignity. Renamed, put in the
+    Silly Cave and left owing the Treasury. All of it survives a restart, because
+    a 24 hour sentence that a redeploy cancels is not a sentence."""
+    rec = user_record(loser.id)
+    debt = random.randint(500, 2500)
+    rec["bones"] = -debt
+
+    original, renamed, caged = None, False, False
+    member = guild.get_member(loser.id) if guild else None
+    if member is not None:
+        original = member.nick
+        candidate = f"Property of {winner.display_name}"
+        if len(candidate) > 32:
+            candidate = random.choice(SHAME_NICKNAMES)
+        try:
+            await member.edit(nick=candidate[:32], reason="Troglodyte OS: raided while broke")
+            renamed = True
+        except (discord.Forbidden, discord.HTTPException):
+            pass
+
+        role = discord.utils.get(guild.roles, name=SILLY_CAVE_ROLE)
+        if role is None:
+            try:
+                role = await guild.create_role(name=SILLY_CAVE_ROLE,
+                                               colour=discord.Colour(0xE91E63),
+                                               reason="Troglodyte OS: silly containment")
+            except (discord.Forbidden, discord.HTTPException):
+                role = None
+        if role is not None:
+            try:
+                await member.add_roles(role, reason="Troglodyte OS: raided while broke")
+                caged = True
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+
+    if renamed or caged:
+        DATA.setdefault("clock", {}).setdefault("shame", []).append({
+            "user": loser.id,
+            "original": original,
+            "nick": renamed,
+            "role": caged,
+            "at": (now_utc() + timedelta(hours=SHAME_HOURS)).isoformat(),
+        })
+    await save_data()
+
+    served = []
+    if renamed:
+        served.append("renamed")
+    if caged:
+        served.append(f"put in the {SILLY_CAVE_ROLE}")
+    served.append(f"left owing the Treasury **{debt:,} Bones**")
+    if len(served) > 1:
+        served[-1] = "and " + served[-1]
+    return debt, ", ".join(served)
+
+
+async def announce_shame(guild, loser, winner, sentence):
+    """The whole point is that everybody sees it."""
+    stage = await daily_stage()
+    if stage is None:
+        return
+    embed = discord.Embed(
+        title="\U0001F3F4 A DEBT IS RECORDED",
+        description=(f"{loser.mention} was raided by **{winner.display_name}** "
+                     f"and had nothing worth taking.\n\n"
+                     f"{random.choice(SHAME_LINES)}\n\n"
+                     f"They have been {sentence}. Every Bone they earn goes to the debt "
+                     f"until it clears."),
+        colour=0xE91E63,
+    )
+    embed.set_footer(text=f"The sentence lifts in {SHAME_HOURS} hours")
+    try:
+        await stage.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        pass
+
+
+class RaidView(discord.ui.View):
+    """Everything the loser has, on five dice. Balances are read at the moment the
+    raid resolves, not when it was declared."""
+
+    def __init__(self, challenger, opponent):
+        super().__init__(timeout=RAID_TIMEOUT)
+        self.challenger = challenger
+        self.opponent = opponent
+        self.settled = False
+        self.message = None
+
+    def _close(self):
+        self.settled = True
+        for child in self.children:
+            child.disabled = True
+        self.stop()
+        _open_raids.discard(self.challenger.id)
+
+    @discord.ui.button(label="Stand and fight", emoji="\U0001F3B2",
+                       style=discord.ButtonStyle.danger)
+    async def stand(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if interaction.user.id != self.opponent.id:
+            await interaction.response.send_message(
+                "\U0001F3B2 This raid is not aimed at you.", ephemeral=True)
+            return
+        if _raided_today(self.opponent.id) or _raided_today(self.challenger.id):
+            self._close()
+            await interaction.response.edit_message(embed=discord.Embed(
+                title="\U0001F3B2 THE RAID",
+                description="One of you has already fought today. The cave has limits.",
+                colour=0x555555), view=self)
+            return
+
+        self._close()
+        rounds, score = _play_raid()
+        winner, loser = ((self.challenger, self.opponent) if score[0] > score[1]
+                         else (self.opponent, self.challenger))
+
+        today = local_today()
+        for person in (self.challenger, self.opponent):
+            user_record(person.id)["last_raid"] = today
+        user_record(winner.id)["raids_won"] = user_record(winner.id).get("raids_won", 0) + 1
+
+        loot = bones_of(loser.id)
+        body = (f"**{self.challenger.display_name}** vs **{self.opponent.display_name}**, "
+                f"first to {RAID_TARGET}.\n\n"
+                f"{_raid_log(rounds, self.challenger, self.opponent)}\n\n"
+                f"### {winner.display_name} wins {max(score)} to {min(score)}\n")
+
+        if loot > 0:
+            user_record(winner.id)["bones"] += loot
+            user_record(loser.id)["bones"] = 0
+            await save_data()
+            body += (f"**{loot:,} Bones** change hands. {loser.display_name} is "
+                     f"left with nothing.")
+            embed = discord.Embed(title="\U0001F3B2 THE RAID", description=body,
+                                  colour=0xC8A165)
+            embed.set_footer(text=f"{winner.display_name} now holds "
+                                  f"{bones_of(winner.id):,} Bones")
+            await interaction.response.edit_message(embed=embed, view=self)
+            return
+
+        debt, sentence = await shame_the_broke(interaction.guild, loser, winner)
+        body += (f"{loser.display_name} had **nothing**. There was no pile to take.\n\n"
+                 f"So they have been {sentence}.")
+        embed = discord.Embed(title="\U0001F3B2 THE RAID", description=body, colour=0xE91E63)
+        embed.set_footer(text=f"Debt: {debt:,} Bones · The rest lifts in {SHAME_HOURS} hours")
+        await interaction.response.edit_message(embed=embed, view=self)
+        await announce_shame(interaction.guild, loser, winner, sentence)
+
+    @discord.ui.button(label="Run", emoji="\U0001F3C3", style=discord.ButtonStyle.secondary)
+    async def run_away(self, interaction: discord.Interaction, _button: discord.ui.Button):
+        if interaction.user.id == self.opponent.id:
+            line = (f"**{self.opponent.display_name}** runs. Their pile is intact and "
+                    f"their reputation is not.")
+        elif interaction.user.id == self.challenger.id:
+            line = f"**{self.challenger.display_name}** calls off the raid. Wise, probably."
+        else:
+            await interaction.response.send_message(
+                "\U0001F3B2 This raid is not aimed at you.", ephemeral=True)
+            return
+        self._close()
+        await interaction.response.edit_message(embed=discord.Embed(
+            title="\U0001F3B2 THE RAID", description=line, colour=0x555555), view=self)
+
+    async def on_timeout(self):
+        if self.settled:
+            return
+        self._close()
+        if self.message is None:
+            return
+        try:
+            await self.message.edit(embed=discord.Embed(
+                title="\U0001F3B2 THE RAID",
+                description=(f"**{self.opponent.display_name}** did not come out. "
+                             f"The raid lapses."),
+                colour=0x555555), view=self)
+        except discord.HTTPException:
+            pass
+
+
+@bot.tree.command(name="raid", description="Once a day. Best of five dice for everything they own.")
+@app_commands.describe(user="Whose pile you are coming for.")
+async def raid(interaction: discord.Interaction, user: discord.Member):
+    if user.bot:
+        await interaction.response.send_message(
+            "\U0001F3B2 I keep no pile. Raid somebody with something to lose.", ephemeral=True)
+        return
+    if user.id == interaction.user.id:
+        await interaction.response.send_message(
+            "\U0001F3B2 Raiding yourself. The Treasury would allow it and you would still lose.",
+            ephemeral=True)
+        return
+    if interaction.user.id in _open_raids:
+        await interaction.response.send_message(
+            "\U0001F3B2 You already have a raid out. Wait for an answer.", ephemeral=True)
+        return
+    if _raided_today(interaction.user.id):
+        await interaction.response.send_message(
+            "\U0001F3B2 One raid a day. You have had yours. Come back tomorrow.", ephemeral=True)
+        return
+    if _raided_today(user.id):
+        await interaction.response.send_message(
+            f"\U0001F3B2 {user.display_name} has already fought today. Pick somebody rested.",
+            ephemeral=True)
+        return
+
+    view = RaidView(interaction.user, user)
+    _open_raids.add(interaction.user.id)
+
+    mine, theirs = bones_of(interaction.user.id), bones_of(user.id)
+    embed = discord.Embed(
+        title="\U0001F3B2 A RAID IS DECLARED",
+        description=(
+            f"**{interaction.user.display_name}** comes for everything "
+            f"**{user.display_name}** owns.\n\n"
+            f"Best of five dice. Highest roll takes the round, first to {RAID_TARGET} "
+            f"takes the whole pile.\n\n"
+            f"On the table: **{mine:,}** against **{theirs:,}** Bones.\n\n"
+            + ("Whoever loses walks away with nothing at all."
+               if min(mine, theirs) > 0 else
+               "One of you has nothing to take. If they lose, the debt gets collected "
+               "in other ways.")
+        ),
+        colour=0xE91E63,
+    )
+    embed.set_footer(text=f"{user.display_name} has {RAID_TIMEOUT // 60} minutes to answer "
+                          f"· One raid each per day")
+    await interaction.response.send_message(content=user.mention, embed=embed, view=view)
+    view.message = await interaction.original_response()
+
+
 @bot.tree.command(name="shop", description="Inspect the goods.")
 async def shop(interaction: discord.Interaction):
     lines = [f"**{name}** · `{cost:,}` 🦴\n*{desc}*"
@@ -1693,6 +2019,8 @@ HELP_SECTIONS = {
         ("/daily", "Daily allowance. 80 to 400 Bones."),
         ("/gamble <amount>", "Stake Bones. Roughly even odds."),
         ("/duel <user> <amount>", "Challenge somebody to a coin flip. Both stake the same."),
+        ("/roll [sides] [dice]", "Throw dice. Six sided and one of them unless you say otherwise."),
+        ("/raid <user>", "Once a day. Best of five dice for everything they own. Losing broke costs more than Bones."),
         ("/rps", "Rock paper scissors. Everything is rock. 6% chance of Advanced Rock."),
         ("/shop", "The goods."),
         ("/buy", "Hand over Bones for one of them."),
@@ -1761,6 +2089,8 @@ COMMAND_HOMES = {
     "daily": "العظام",
     "gamble": "العظام",
     "duel": "العظام",
+    "raid": "العظام",
+    "roll": "العظام",
     "shop": "العظام",
     "buy": "العظام",
     "leaderboard": "العظام",
@@ -2813,8 +3143,10 @@ async def ev_nickname(guild):
     if (DATA.get("clock") or {}).get("nick_restore"):
         return None                                   # one at a time
 
+    serving = {e.get("user") for e in ((DATA.get("clock") or {}).get("shame") or [])}
     pool = [m for m in active_members(guild)
-            if m != guild.owner and m.top_role < guild.me.top_role]
+            if m != guild.owner and m.top_role < guild.me.top_role
+            and m.id not in serving]
     if not pool:
         return None
 
@@ -2858,6 +3190,44 @@ async def restore_nicknames(guild):
             pass
     clock.pop("nick_restore", None)
     await save_data()
+
+
+async def release_the_shamed(guild):
+    """Let raid losers out when their 24 hours are up. Kept in DATA rather than an
+    asyncio timer, so a redeploy in the middle of a sentence does not cancel it."""
+    clock = DATA.setdefault("clock", {})
+    pending = clock.get("shame") or []
+    if not pending:
+        return
+    now, keep, freed = now_utc(), [], False
+    for entry in pending:
+        try:
+            due = datetime.fromisoformat(entry["at"])
+        except (KeyError, ValueError):
+            due = now                                 # malformed, let them out now
+        if now < due:
+            keep.append(entry)
+            continue
+        freed = True
+        member = guild.get_member(entry.get("user", 0))
+        if member is None:
+            continue
+        if entry.get("nick"):
+            try:
+                await member.edit(nick=entry.get("original"),
+                                  reason="Troglodyte OS: debt served")
+            except (discord.Forbidden, discord.HTTPException):
+                pass
+        if entry.get("role"):
+            role = discord.utils.get(guild.roles, name=SILLY_CAVE_ROLE)
+            if role is not None and role in member.roles:
+                try:
+                    await member.remove_roles(role, reason="Troglodyte OS: debt served")
+                except (discord.Forbidden, discord.HTTPException):
+                    pass
+    if freed:
+        clock["shame"] = keep
+        await save_data()
 
 
 EVENT_POOL = [
@@ -3063,6 +3433,7 @@ async def cave_events():
     if channel is None:
         return
     await restore_nicknames(channel.guild)      # runs every tick, not just on event
+    await release_the_shamed(channel.guild)     # and so does letting raid losers out
     if not _due("next_event", minutes=random.randint(30, 60)):
         return
     await save_data()
