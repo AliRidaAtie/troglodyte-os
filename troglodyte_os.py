@@ -32,6 +32,7 @@ EVENT_CHANNEL = os.getenv("EVENT_CHANNEL_ID")
 MUSEUM_CHANNEL = os.getenv("MUSEUM_CHANNEL_ID")
 
 DATA_FILE = Path(__file__).parent / "troglodyte_data.json"
+BANK_FILE = Path(__file__).parent / "troglodyte_trivia.json"
 MUSEUM_EMOJI = "🗿"
 MUSEUM_THRESHOLD = 3
 SILLY_CAVE_ROLE = "🚪 Silly Cave"
@@ -67,6 +68,45 @@ def load_data():
 
 DATA = load_data()
 _save_lock = asyncio.Lock()
+
+
+def load_bank():
+    """The trivia bank lives in its own file. It is the only part of the state that
+    grows without limit, and the ledger is rewritten on every message somebody
+    sends, so keeping thousands of questions in there would mean writing megabytes
+    per Bone earned."""
+    if BANK_FILE.exists():
+        try:
+            with open(BANK_FILE, "r", encoding="utf-8") as fh:
+                bank = json.load(fh)
+            bank.setdefault("pool", {})
+            bank.setdefault("asked", [])
+            return bank
+        except (json.JSONDecodeError, OSError):
+            print("[!] trivia bank unreadable, starting a new one")
+    return {"pool": {}, "asked": []}
+
+
+BANK = load_bank()
+_bank_lock = asyncio.Lock()
+
+# anything banked before the split moves across once, then stays out of the ledger
+_legacy = DATA.get("trivia") or {}
+if (_legacy.get("pool") or _legacy.get("asked")) and not (BANK["pool"] or BANK["asked"]):
+    BANK["pool"] = _legacy.get("pool") or {}
+    BANK["asked"] = _legacy.get("asked") or []
+    print(f"[+] moved {sum(len(v) for v in BANK['pool'].values())} banked questions "
+          f"out of the ledger")
+_legacy.pop("pool", None)
+_legacy.pop("asked", None)
+
+
+async def save_bank():
+    async with _bank_lock:
+        tmp = BANK_FILE.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(BANK, fh, ensure_ascii=False, separators=(",", ":"))
+        tmp.replace(BANK_FILE)
 
 
 async def save_data():
@@ -2167,14 +2207,14 @@ TRIVIA_DEFAULT_LEVEL = "medium"
 HINT_SHARE = 4               # answer after the hint and you take a quarter
 TRIVIA_DELAY = 5             # seconds before an answer is allowed to count
 _trivia_busy = False         # deliberately not in DATA. saving it would wedge the contest
-TRIVIA_MEMORY = 500          # how many past questions we refuse to ask again
-TRIVIA_BATCH = 8             # questions fetched per call, so one call feeds a whole round
-TRIVIA_REFILL_AT = 3         # top the pool up quietly once it drops this low
+TRIVIA_MEMORY = 2000         # how many past questions we refuse to ask again
+TRIVIA_BATCH = 20            # questions fetched per call, so one call feeds a whole round
+TRIVIA_REFILL_AT = 25        # top the pool up quietly once it drops this low
 TRIVIA_GIVE_UP = 3           # unanswered questions in a row before I stop talking to myself
 DAILY_HOUR = 12              # noon in Beirut, when the daily output goes out
 CAVE_TZ = ZoneInfo("Asia/Beirut")
-TRIVIA_POOL_TARGET = 100     # how deep each subject and difficulty gets stocked
-TRIVIA_TOPUP_EVERY = 15      # minutes between quiet background top-ups
+TRIVIA_POOL_TARGET = 1000    # how deep each subject and difficulty gets stocked
+TRIVIA_TOPUP_EVERY = 5       # minutes between quiet background top-ups
 TRIVIA_WAIT = 20             # the longest I will ever keep the thread waiting on Google
 TRIVIA_BREATHER = 12         # seconds of quiet between questions, with a way out
 _trivia_round = 0            # runtime only, so a stale timer cannot fire on a new question
@@ -2259,6 +2299,90 @@ def _flatten(text):
     text = re.sub(r"[^a-z0-9؀-ۿ ]+", " ", text)
     text = re.sub(r"\b(the|a|an|of|el|al)\b", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+QUESTION_NOISE = frozenset("""
+what which who whom whose where where when why how many much is are was were does do did
+in on at to for from by with and or but it its this that these those you your name named
+called known most first last there here has have had been being can could would should
+if as than then does country city year word letter number thing person
+""".split())
+
+
+def _content(flat):
+    """The words that carry the question. Everything else is scaffolding."""
+    return {w for w in flat.split() if len(w) > 2 and w not in QUESTION_NOISE}
+
+
+class AskedMemory:
+    """What has been asked already, in a shape that catches rewordings.
+
+    Comparing whole question strings is not enough. The model rewords the same
+    famous fact endlessly, so "what is the chemical symbol for gold" and "which
+    element has the symbol Au" both sail through a string check and land in the
+    thread as an obvious repeat. A question counts as already asked if it flattens
+    to something seen before, if it shares its answer and most of its content words
+    with an earlier one, or if it is a near miss on the whole sentence."""
+
+    NEAR_MISS = 0.88
+    NEAR_MISS_OVERLAP = 0.7
+
+    def __init__(self, rows=()):
+        self.flats = []
+        self.exact = set()
+        self.by_answer = {}
+        self.by_word = {}
+        for row in rows:
+            self.remember(row.get("q", ""), row.get("a", ""))
+
+    def remember(self, question, answer=""):
+        flat = _flatten(question)
+        if not flat or flat in self.exact:
+            return
+        words = _content(flat)
+        index = len(self.flats)
+        self.flats.append((flat, words))
+        self.exact.add(flat)
+        key = _flatten(answer)
+        if key:
+            self.by_answer.setdefault(key, []).append(index)
+        for word in words:
+            self.by_word.setdefault(word, set()).add(index)
+
+    def seen(self, question, answer="", accepts=()):
+        flat = _flatten(question)
+        if not flat or flat in self.exact:
+            return True
+        words = _content(flat)
+        if not words:
+            return False
+
+        # the answer is the fact. Asking for mitochondria a second time is a repeat
+        # however cleverly the question is dressed up, and even where it really is
+        # a different fact the thread still sees the same word win twice.
+        for form in [answer] + list(accepts or []):
+            if _flatten(form) in self.by_answer:
+                return True
+
+        # a near miss on the sentence, for the cases the answer check misses, such
+        # as 206 against "two hundred and six". Both the wording and the content
+        # words have to line up: "symbol for gold" and "symbol for silver" read
+        # almost identically and are not the same question. Only questions sharing
+        # vocabulary are compared, so this stays cheap as the bank grows.
+        near = set()
+        for word in words:
+            near |= self.by_word.get(word) or set()
+        for index in near:
+            prior, prior_words = self.flats[index]
+            if not prior_words or self._overlap(words, prior_words) < self.NEAR_MISS_OVERLAP:
+                continue
+            if difflib.SequenceMatcher(None, flat, prior).ratio() >= self.NEAR_MISS:
+                return True
+        return False
+
+    @staticmethod
+    def _overlap(one, two):
+        return len(one & two) / len(one | two)
 
 
 def _close(a, b):
@@ -2353,38 +2477,54 @@ async def stock_pool(topic_key, level, count=TRIVIA_BATCH):
     try:
         label = TRIVIA_LABELS.get(topic_key, ("General Knowledge", ""))[0]
         tier = TRIVIA_LEVELS.get(level, TRIVIA_LEVELS[TRIVIA_DEFAULT_LEVEL])
-        store = DATA.setdefault("trivia", {})
-        asked = store.setdefault("asked", [])
-        pool = store.setdefault("pool", {}).setdefault(slot, [])
-        seen = {_flatten(q) for q in asked} | {_flatten(i["question"]) for i in pool}
-        listing = "\\n".join(f"- {q}" for q in asked[-60:]) or "- (nothing yet)"
+        rows = _asked_rows()
+        pool = BANK.setdefault("pool", {}).setdefault(slot, [])
+        memory = AskedMemory(rows)
+        for item in pool:
+            memory.remember(item["question"], item.get("answer", ""))
+
+        # show it this subject's own history, not a global mix. it was being joined
+        # with a literal backslash-n for months, so the model never read a list at all
+        recent = [row["q"] for row in rows if row.get("t") == topic_key][-80:]
+        listing = "\n".join(f"- {q}" for q in recent) or "- (nothing yet)"
 
         raw = await ask_gemini(
             TRIVIA_PROMPT.format(count=count, topic=label, seen=listing,
-                                 difficulty=tier["brief"]), max_tokens=1800)
+                                 difficulty=tier["brief"]), max_tokens=5000)
 
         fresh = []
         for item in _parse_batch(raw):
-            key = _flatten(item["question"])
-            if key in seen:
+            if memory.seen(item["question"], item.get("answer", ""), item.get("accept")):
                 continue
-            seen.add(key)
+            memory.remember(item["question"], item.get("answer", ""))
             fresh.append(item)
         pool.extend(fresh)
-        await save_data()
+        await save_bank()
         return len(fresh)
     finally:
         _stocking.discard(slot)
 
 
-def _take_unasked(pool, seen):
+def _asked_rows():
+    """The asked list used to hold bare question strings. Each row now carries its
+    answer and its subject too: the answer is what catches a reworded repeat, and
+    the subject is what lets the prompt show the model the right history."""
+    rows = BANK.setdefault("asked", [])
+    for i, row in enumerate(rows):
+        if isinstance(row, str):
+            rows[i] = {"q": row, "a": "", "t": ""}
+    return rows
+
+
+def _take_unasked(pool, memory):
     """Pop the first one nobody has been asked yet, dropping any stale duplicates.
 
     The pool is per subject and difficulty but the asked list is global, so a
     question banked for Medium can easily have been asked already on Easy."""
     while pool:
         item = pool.pop(0)
-        if _flatten(item["question"]) not in seen:
+        if not memory.seen(item["question"], item.get("answer", ""),
+                           item.get("accept")):
             return item
     return None
 
@@ -2397,11 +2537,10 @@ async def quiet_stock(topic_key, level):
         print(f"[!] background restock {topic_key}/{level}: {exc}")
 
 
-def spare_question(level, asked):
+def spare_question(level, memory):
     """Off the shelf in the code. Instant, and it has never needed a network."""
-    seen = {_flatten(q) for q in asked}
     spares = SPARE_QUESTIONS.get(level) or SPARE_QUESTIONS[TRIVIA_DEFAULT_LEVEL]
-    fresh = [row for row in spares if _flatten(row[0]) not in seen]
+    fresh = [row for row in spares if not memory.seen(row[0], row[1], row[2])]
     if not fresh:
         return None
     question, answer, accept = random.choice(fresh)
@@ -2411,28 +2550,28 @@ def spare_question(level, asked):
 async def trivia_question(topic_key, level):
     """Serve from the bank. Google is never on the critical path unless the bank
     and the shelf are both bare, and even then it gets a short leash."""
-    store = DATA.setdefault("trivia", {})
     slot = pool_key(topic_key, level)
-    pool = store.setdefault("pool", {}).setdefault(slot, [])
-    asked = store.setdefault("asked", [])
+    pool = BANK.setdefault("pool", {}).setdefault(slot, [])
+    rows = _asked_rows()
+    memory = AskedMemory(rows)
 
-    seen = {_flatten(q) for q in asked}
-    item = _take_unasked(pool, seen)             # a shelf can hold one asked elsewhere
+    item = _take_unasked(pool, memory)           # a shelf can hold one asked elsewhere
     if item is None:
-        item = spare_question(level, asked)      # nothing banked. use the shelf
+        item = spare_question(level, memory)     # nothing banked. use the shelf
     if item is None:                             # shelf bare too. now ask, briefly
         try:
             await asyncio.wait_for(stock_pool(topic_key, level), TRIVIA_WAIT)
         except Exception:                        # timeout, quota, bad reply, anything
             pass
-        pool = store["pool"].setdefault(slot, [])
-        item = _take_unasked(pool, seen)
+        pool = BANK["pool"].setdefault(slot, [])
+        item = _take_unasked(pool, memory)
     if item is None:
         return None
 
-    asked.append(item["question"])
-    del asked[:-TRIVIA_MEMORY]
-    await save_data()
+    rows.append({"q": item["question"], "a": item.get("answer", ""), "t": topic_key})
+    del rows[:-TRIVIA_MEMORY]
+    BANK["last_played"] = slot                   # keep the shelf in use the deepest
+    await save_bank()
 
     if len(pool) <= TRIVIA_REFILL_AT:
         asyncio.create_task(quiet_stock(topic_key, level))
@@ -3535,15 +3674,22 @@ async def restock_the_bank():
     by the time anyone presses a button there is already a queue waiting."""
     if not GEMINI_KEYS:
         return
-    pools = DATA.setdefault("trivia", {}).setdefault("pool", {})
-    thin = [(len(pools.get(pool_key(key, level), [])), key, level)
-            for key, _label, _emoji in TRIVIA_CATEGORIES
-            for level in TRIVIA_LEVELS]
-    thin = [row for row in thin if row[0] < TRIVIA_POOL_TARGET]
-    if not thin:
-        return
-    thin.sort()                                  # the emptiest shelf first
-    _count, topic_key, level = thin[0]
+    pools = BANK.setdefault("pool", {})
+
+    # the shelf somebody is actually playing comes first. filling all 24 evenly
+    # means the subject in use is the last one to get deep, which is backwards
+    played = BANK.get("last_played")
+    if played and ":" in played and len(pools.get(played, [])) < TRIVIA_POOL_TARGET:
+        topic_key, level = played.split(":", 1)
+    else:
+        thin = [(len(pools.get(pool_key(key, lvl), [])), key, lvl)
+                for key, _label, _emoji in TRIVIA_CATEGORIES
+                for lvl in TRIVIA_LEVELS]
+        thin = [row for row in thin if row[0] < TRIVIA_POOL_TARGET]
+        if not thin:
+            return
+        thin.sort()                              # otherwise the emptiest shelf
+        _count, topic_key, level = thin[0]
     try:
         got = await stock_pool(topic_key, level)
         if got:
