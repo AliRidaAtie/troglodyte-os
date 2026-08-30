@@ -1,5 +1,6 @@
 .env
 troglodyte_data.json
+troglodyte_trivia.json
 __pycache__/
 .venv/
 *.log
