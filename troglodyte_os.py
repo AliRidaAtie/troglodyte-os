@@ -10,11 +10,13 @@ Setup lives in README.md. Short version:
 
 import asyncio
 import difflib
+import html
 import json
 import os
 import random
 import re
 import unicodedata
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -551,7 +553,7 @@ async def on_ready():
     except Exception as exc:  # noqa: BLE001
         print(f"[!] command sync failed: {exc}")
     for task in (cave_events, daily_question, daily_roast, daily_prophecy,
-                 restock_the_bank):
+                 restock_the_bank, free_questions_first):
         if not task.is_running():
             task.start()
     bot.add_view(TriviaView())          # keeps the contest buttons alive across restarts
@@ -2214,6 +2216,8 @@ TRIVIA_GIVE_UP = 3           # unanswered questions in a row before I stop talki
 DAILY_HOUR = 12              # noon in Beirut, when the daily output goes out
 CAVE_TZ = ZoneInfo("Asia/Beirut")
 TRIVIA_POOL_TARGET = 1000    # how deep each subject and difficulty gets stocked
+TRIVIA_ASK_BELOW = 150       # the only time Gemini is worth spending. above this the
+                             # shelf is deep enough and the free database does the rest
 TRIVIA_TOPUP_EVERY = 5       # minutes between quiet background top-ups
 TRIVIA_WAIT = 20             # the longest I will ever keep the thread waiting on Google
 TRIVIA_BREATHER = 12         # seconds of quiet between questions, with a way out
@@ -3668,6 +3672,142 @@ async def _before_prophecy():
     await bot.wait_until_ready()
 
 
+# ---------------------------------------------------------------------------
+# the free shelf: the Open Trivia Database
+# ---------------------------------------------------------------------------
+# About 5,300 human written, human verified questions. No key, no quota, no
+# account, one request every five seconds. Pulling the lot takes a quarter of an
+# hour, once, and after that the bank is deep enough that Gemini is only ever
+# asked to top up a shelf people have actually played dry. That is the whole
+# trick to having many questions without burning the API.
+
+OPENTDB_GAP = 6              # seconds between calls. their limit is one every five
+OPENTDB_TRIES = 3            # attempts per shelf before leaving it for the next run
+OPENTDB_CATEGORIES = {
+    "general":   [9, 10, 20, 24, 25, 26, 27, 28],   # plus books, myth, art, animals
+    "history":   [23],
+    "science":   [17, 18, 19, 30],                  # nature, computers, maths, gadgets
+    "geography": [22],
+    "sport":     [21],
+    "film":      [11, 14],                          # film and television
+    "music":     [12, 13],
+    "games":     [15, 16, 29, 31, 32],
+}
+
+
+def _opentdb_clean(text):
+    """Their JSON is percent encoded so the punctuation survives the trip."""
+    return html.unescape(urllib.parse.unquote(str(text or ""))).strip()
+
+
+async def _opentdb_get(session, path, params):
+    async with session.get(f"https://opentdb.com/{path}", params=params) as reply:
+        if reply.status != 200:
+            raise RuntimeError(f"opentdb {reply.status}")
+        return json.loads(await reply.text())
+
+
+async def harvest_opentdb():
+    """Walk the free database into the bank, one shelf at a time.
+
+    A session token is what makes this finish: with one, they never hand back a
+    question already given, and they say so plainly when a shelf is empty. Every
+    shelf that runs dry is recorded, so a restart carries on instead of starting
+    over, and once they are all done this never runs again."""
+    import aiohttp
+
+    done = set(BANK.setdefault("harvested", []))
+    shelves = [(topic, level, cat)
+               for topic, cats in OPENTDB_CATEGORIES.items()
+               for level in TRIVIA_LEVELS
+               for cat in cats
+               if f"{topic}:{level}:{cat}" not in done]
+    if not shelves:
+        return 0
+
+    memory = AskedMemory(_asked_rows())
+    for items in BANK.setdefault("pool", {}).values():
+        for item in items:
+            memory.remember(item["question"], item.get("answer", ""))
+
+    taken = 0
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        try:
+            reply = await _opentdb_get(session, "api_token.php", {"command": "request"})
+            token = reply.get("token")
+        except Exception as exc:                     # noqa: BLE001
+            print(f"[!] opentdb unreachable: {exc}")
+            return 0
+        if not token:
+            return 0
+
+        for topic, level, cat in shelves:
+            slot = pool_key(topic, level)
+            pool = BANK["pool"].setdefault(slot, [])
+            empty = False
+            for _attempt in range(OPENTDB_TRIES):
+                if len(pool) >= TRIVIA_POOL_TARGET:
+                    break
+                await asyncio.sleep(OPENTDB_GAP)
+                try:
+                    reply = await _opentdb_get(session, "api.php", {
+                        "amount": 50, "category": cat, "difficulty": level,
+                        "type": "multiple", "encode": "url3986", "token": token})
+                except Exception as exc:             # noqa: BLE001
+                    print(f"[!] opentdb {topic}/{level}/{cat}: {exc}")
+                    break
+                code = reply.get("response_code")
+                if code in (1, 4):                   # nothing left on this shelf
+                    empty = True
+                    break
+                if code != 0:
+                    break
+
+                fresh = 0
+                for row in reply.get("results") or []:
+                    item = _usable({
+                        "question": _opentdb_clean(row.get("question")),
+                        "answer": _opentdb_clean(row.get("correct_answer")),
+                        "accept": [],
+                    })
+                    if item is None:
+                        continue
+                    if memory.seen(item["question"], item["answer"]):
+                        continue
+                    memory.remember(item["question"], item["answer"])
+                    pool.append(item)
+                    fresh += 1
+                taken += fresh
+                if fresh:
+                    print(f"[+] opentdb gave {fresh} for {topic}/{level} "
+                          f"({len(pool)} on the shelf)")
+
+            if empty or len(pool) >= TRIVIA_POOL_TARGET:
+                BANK["harvested"].append(f"{topic}:{level}:{cat}")
+            await save_bank()
+
+    if taken:
+        print(f"[+] harvest done for this pass: {taken} questions, "
+              f"{len(BANK['harvested'])} shelves finished")
+    return taken
+
+
+@tasks.loop(hours=6)
+async def free_questions_first():
+    """Keep at it until the free database is exhausted, then stop bothering them."""
+    try:
+        await harvest_opentdb()
+    except Exception as exc:                         # noqa: BLE001
+        print(f"[!] harvest: {exc}")
+
+
+@free_questions_first.before_loop
+async def _harvest_waits():
+    await bot.wait_until_ready()
+    await asyncio.sleep(30)                          # let the bot settle in first
+
+
 @tasks.loop(minutes=TRIVIA_TOPUP_EVERY)
 async def restock_the_bank():
     """Deepens the shelves while nobody is looking, one subject at a time, so that
@@ -3679,15 +3819,15 @@ async def restock_the_bank():
     # the shelf somebody is actually playing comes first. filling all 24 evenly
     # means the subject in use is the last one to get deep, which is backwards
     played = BANK.get("last_played")
-    if played and ":" in played and len(pools.get(played, [])) < TRIVIA_POOL_TARGET:
+    if played and ":" in played and len(pools.get(played, [])) < TRIVIA_ASK_BELOW:
         topic_key, level = played.split(":", 1)
     else:
         thin = [(len(pools.get(pool_key(key, lvl), [])), key, lvl)
                 for key, _label, _emoji in TRIVIA_CATEGORIES
                 for lvl in TRIVIA_LEVELS]
-        thin = [row for row in thin if row[0] < TRIVIA_POOL_TARGET]
+        thin = [row for row in thin if row[0] < TRIVIA_ASK_BELOW]
         if not thin:
-            return
+            return                               # every shelf is deep. spend nothing
         thin.sort()                              # otherwise the emptiest shelf
         _count, topic_key, level = thin[0]
     try:
