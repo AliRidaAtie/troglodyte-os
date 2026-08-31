@@ -590,7 +590,7 @@ async def on_message(message):
 
     before = title_for(rec["messages"])
     rec["messages"] += 1
-    rec["bones"] += 2 if (law and law.get("kind") == "double") else 1
+    rec["bones"] += 4 if (law and law.get("kind") == "double") else 2
     after = title_for(rec["messages"])
 
     if law and law.get("kind") == "word_tax":
@@ -890,15 +890,15 @@ async def rps(interaction: discord.Interaction):
     player = "🗿 Advanced Rock" if player_advanced else "🪨 Rock"
     house = "🗿 Advanced Rock" if house_advanced else "🪨 Rock"
     if player_advanced and not house_advanced:
-        verdict, colour, reward = "**You win.** Advanced Rock is simply better.", 0x2E8B57, 250
+        verdict, colour, reward = "**You win.** Advanced Rock is simply better.", 0x2E8B57, 350
     elif house_advanced and not player_advanced:
         verdict, colour, reward = "**You lose.** The cave produced Advanced Rock. Nothing could be done.", 0x8B0000, 0
     elif player_advanced and house_advanced:
-        verdict, colour, reward = "Two Advanced Rocks. The scholars have been notified. Draw.", 0xC8A165, 60
+        verdict, colour, reward = "Two Advanced Rocks. The scholars have been notified. Draw.", 0xC8A165, 100
     else:
-        verdict, colour, reward = "Rock versus Rock. As it has always been. Draw.", 0x8B6F47, 5
+        verdict, colour, reward = "Rock versus Rock. As it has always been. Draw.", 0x8B6F47, 10
     rec["bones"] += reward
-    if reward >= 250:
+    if reward >= 350:
         rec["rps_wins"] += 1
     await save_data()
     embed = discord.Embed(title="🪨 ROCK, PAPER, SCISSORS", colour=colour)
@@ -966,7 +966,7 @@ async def daily(interaction: discord.Interaction):
         await interaction.response.send_message(
             "🦴 You have already been paid today. The Treasury remembers.", ephemeral=True)
         return
-    amount = random.randint(80, 400)
+    amount = random.randint(200, 800)
     rec["last_daily"] = today
     rec["bones"] += amount
     await save_data()
@@ -2057,8 +2057,8 @@ HELP_SECTIONS = {
         ("/lore", "Generates fake server history."),
     ],
     "Economy": [
-        ("/bones [user]", "Check holdings. You earn 1 per message automatically."),
-        ("/daily", "Daily allowance. 80 to 400 Bones."),
+        ("/bones [user]", "Check holdings. You earn 2 per message automatically."),
+        ("/daily", "Daily allowance. 200 to 800 Bones."),
         ("/gamble <amount>", "Stake Bones. Roughly even odds."),
         ("/duel <user> <amount>", "Challenge somebody to a coin flip. Both stake the same."),
         ("/roll [sides] [dice]", "Throw dice. Six sided and one of them unless you say otherwise."),
@@ -2094,7 +2094,7 @@ async def help_cmd(interaction: discord.Interaction, section: app_commands.Choic
         colour=0x8B6F47,
         description=(
             "Nothing here needs setting up to use. Type a slash command and it works.\n\n"
-            "**Running quietly in the background:** you earn 1 Bone per message, your title climbs "
+            "**Running quietly in the background:** you earn 2 Bones per message, your title climbs "
             f"on its own, reacting {MUSEUM_EMOJI} to any message three times files it in the museum "
             "permanently, and a random cave event fires every 30 to 60 minutes. Some of them cost "
             "you money.\n\n"
@@ -2192,21 +2192,24 @@ bot.tree.interaction_check = _where_it_belongs
 TRIVIA_THREAD_NAME = "\U0001f3b2 المسابقة"
 TRIVIA_LEVELS = {
     "easy": {
-        "label": "Easy", "emoji": "\U0001f7e2", "seconds": 120, "reward": 100,
+        "label": "Easy", "emoji": "\U0001f7e2", "seconds": 120, "reward": 60,
         "brief": "Common knowledge. A casual adult should get about eight in ten.",
     },
     "medium": {
-        "label": "Medium", "emoji": "\U0001f7e1", "seconds": 75, "reward": 300,
+        "label": "Medium", "emoji": "\U0001f7e1", "seconds": 75, "reward": 180,
         "brief": "A well read adult should get about half of them.",
     },
     "hard": {
-        "label": "Hard", "emoji": "\U0001f534", "seconds": 40, "reward": 700,
+        "label": "Hard", "emoji": "\U0001f534", "seconds": 40, "reward": 400,
         "brief": ("Genuinely hard. A well read adult should get about one in five. Still one "
                   "short factual answer that a person could actually know, not obscure noise."),
     },
 }
 TRIVIA_DEFAULT_LEVEL = "medium"
 HINT_SHARE = 4               # answer after the hint and you take a quarter
+STREAK_STEP = 50             # per question past the second
+STREAK_CAP = 500             # and no further. an unbounded streak was paying out
+                             # more than the question itself, several times over
 TRIVIA_DELAY = 5             # seconds before an answer is allowed to count
 _trivia_busy = False         # deliberately not in DATA. saving it would wedge the contest
 TRIVIA_MEMORY = 2000         # how many past questions we refuse to ask again
@@ -2389,34 +2392,65 @@ class AskedMemory:
         return len(one & two) / len(one | two)
 
 
-def _close(a, b):
-    return a == b or (len(b) > 3 and difflib.SequenceMatcher(None, a, b).ratio() >= 0.85)
+def _edits(one, two, cap):
+    """Levenshtein, giving up as soon as the answer is clearly no."""
+    if abs(len(one) - len(two)) > cap:
+        return cap + 1
+    previous = list(range(len(two) + 1))
+    for i, a in enumerate(one, 1):
+        row = [i]
+        for j, b in enumerate(two, 1):
+            row.append(min(previous[j] + 1, row[j - 1] + 1, previous[j - 1] + (a != b)))
+        if min(row) > cap:
+            return cap + 1
+        previous = row
+    return previous[-1]
+
+
+def _slack(word):
+    """How many letters somebody is allowed to get wrong.
+
+    Short words and numbers get none. On four letters a single letter is usually a
+    different answer rather than a typo: iron and Iran, red and Reds, 1968 and
+    1969. From five letters up a slip is far likelier than a coincidence."""
+    if len(word) <= 4 or word.isdigit():
+        return 0
+    return 1 if len(word) <= 7 else 2
+
+
+def _word_ok(said, wanted):
+    cap = _slack(wanted)
+    return said == wanted or _edits(said, wanted, cap) <= cap
 
 
 def trivia_matches(given, answer, accept):
-    """People type "uhh 1969 maybe" and "tesla". Both should count."""
+    """Close enough means a typo, not a different answer.
+
+    A one word answer may be out by a letter or two, so "jupitor" counts and
+    nobody loses a round to bad spelling. Anything with a space has to have every
+    word of it: "wall" is not "Hadrians Wall", and "vitamin c" is not "Vitamin D".
+    Fuzzy matching on the whole sentence used to accept both of those, because the
+    two strings really are 88 percent identical. They are still different answers."""
     guess = _flatten(given)
     if not guess or len(guess) > 120:
         return False
-    written = guess.split()
+    said = guess.split()
 
     for candidate in [answer] + list(accept or []):
         target = _flatten(candidate)
         if not target:
             continue
-        words = target.split()
         if guess == target:
             return True
-        if len(target) >= 5 and target in guess:
-            return True
-        # every word of the answer turns up somewhere in what they wrote
-        if all(any(_close(word, said) for said in written) for word in words):
-            return True
-        # surnames: "tesla" for "nikola tesla"
-        if (len(words) == 2 and len(words[-1]) >= 4
-                and not words[0].isdigit() and guess == words[-1]):
-            return True
-        if difflib.SequenceMatcher(None, guess, target).ratio() >= 0.88:
+        wanted = target.split()
+        if len(wanted) == 1:
+            # one word, so it can sit anywhere in "uhh tokyo maybe"
+            if any(_word_ok(word, target) for word in said):
+                return True
+            continue
+        if len(said) < len(wanted):
+            continue                             # a piece of the answer is not the answer
+        if all(any(_word_ok(word, need) for word in said) for need in wanted):
             return True
     return False
 
@@ -2814,7 +2848,7 @@ async def trivia_answer(message):
     base = active.get("reward", TRIVIA_LEVELS[TRIVIA_DEFAULT_LEVEL]["reward"])
     hinted = bool(active.get("hinted"))
     award = max(1, base // HINT_SHARE) if hinted else base
-    bonus = 100 * (streak - 2) if streak >= 3 else 0
+    bonus = min(STREAK_CAP, STREAK_STEP * (streak - 2)) if streak >= 3 else 0
     rec["bones"] += award + bonus
     await save_data()
 
